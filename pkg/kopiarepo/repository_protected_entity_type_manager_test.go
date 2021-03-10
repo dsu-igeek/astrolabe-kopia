@@ -16,15 +16,17 @@
 package kopiarepo
 
 import (
+	"bytes"
 	"context"
-	"fmt"
+	"github.com/google/uuid"
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/blob/filesystem"
-	"github.com/kopia/kopia/snapshot"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/vmware-tanzu/astrolabe/pkg/astrolabe"
-	"testing"
 	astrolabefs "github.com/vmware-tanzu/astrolabe/pkg/fs"
+	"io"
+	"testing"
 )
 
 func Test(t *testing.T) {
@@ -48,7 +50,7 @@ func Test(t *testing.T) {
 	if err != nil {
 		t.Fatalf("can't open: %v", err)
 	}
-
+/*
 	actualSources, err := snapshot.ListSources(ctx, rep)
 	if err != nil {
 		t.Errorf("error listing sources: %v", err)
@@ -64,6 +66,7 @@ func Test(t *testing.T) {
 	for _, snapshot := range snapshots {
 		fmt.Printf("%v\n", snapshot)
 	}
+ */
 	logger := logrus.StandardLogger()
 	rpetm, err := NewProtectedEntityTypeManager(context.TODO(), "fs", rep, logger)
 
@@ -81,8 +84,13 @@ func Test(t *testing.T) {
 	}
 	for _, fsPEID := range fsPEs {
 		// FS doesn't have snapshots, but repository likes them, so fake one
+		snapID, err := uuid.NewRandom()
+
+		if err != nil {
+			t.Fatal(err)
+		}
 		snapPEID := astrolabe.NewProtectedEntityIDWithSnapshotID(fsPEID.GetPeType(), fsPEID.GetID(),
-			astrolabe.NewProtectedEntitySnapshotID("dummy-snap-id"))
+			astrolabe.NewProtectedEntitySnapshotID(snapID.String()))
 		fsPE, err := fsPETM.GetProtectedEntity(ctx, snapPEID)
 		if err != nil {
 			t.Fatal(err)
@@ -91,7 +99,31 @@ func Test(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		logger.Printf("Creted new s3PE %s\n", s3PE.GetID().String())
+		logger.Printf("Created new kopia PE %s\n", s3PE.GetID().String())
+
+		rep.Close(ctx)
+
+		newRep, err := repo.Open(ctx, configFile, masterPassword, openOpt)
+		if err != nil {
+			t.Fatalf("can't open: %v", err)
+		}
+		rpetm, err := NewProtectedEntityTypeManager(context.TODO(), "fs", newRep, logger)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		checkPE, err := rpetm.GetProtectedEntity(ctx, fsPE.GetID())
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		fsDataReader, err := fsPE.GetDataReader(ctx)
+		checkDataReader, err := checkPE.GetDataReader(ctx)
+		err = compareStreams(fsDataReader, checkDataReader)
+		if err != nil {
+			t.Fatal(err)
+		}
 		/*
 		newFSPE, err := fsPETM.Copy(ctx, s3PE, make(map[string]map[string]interface{}), astrolabe.AllocateNewObject)
 		if err != nil {
@@ -100,4 +132,38 @@ func Test(t *testing.T) {
 		logger.Printf("Restored new FSPE %s\n", newFSPE.GetID().String())
 		 */
 	}
+	rep.Close(ctx)
+}
+
+func compareStreams(stream1, stream2 io.ReadCloser) error {
+	for {
+		buf1 := make([]byte, 1024*1024)
+		buf2 := make([]byte, 1024*1024)
+		s1BytesRead, err1 := io.ReadFull(stream1, buf1)
+
+		s2BytesRead, err2 := io.ReadFull(stream2, buf2)
+		if err1 != nil || err2 != nil {
+			if err1 == io.EOF && err2 == io.EOF {
+				return nil
+			} else if err1 == io.EOF || err2 == io.EOF {
+				return errors.New("Mismatched stream length")
+			} else {
+				if ! (s1BytesRead > 0 && s1BytesRead == s2BytesRead) {
+					// If we didn't get an EOF and the number of bytes read is non-zero, assume we got an unexpected EOF
+					// and a short read and we'll loop around
+					if err1 != nil {
+						return err1
+					}
+					return err2
+				}
+			}
+		}
+		if s1BytesRead != s2BytesRead {
+			return errors.New("Mismatched read lengths")
+		}
+		if !bytes.Equal(buf1, buf2) {
+			return errors.New("buffers do not match")
+		}
+	}
+	return nil
 }

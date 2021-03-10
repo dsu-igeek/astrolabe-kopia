@@ -51,51 +51,44 @@ func (recv ProtectedEntityTypeManager) GetTypeName() string {
 }
 
 func (recv ProtectedEntityTypeManager) GetProtectedEntity(ctx context.Context, id astrolabe.ProtectedEntityID) (astrolabe.ProtectedEntity, error) {
-	sources, err := snapshot.ListSources(ctx, recv.repository)
+	source := getSourceInfo(id)
+
+	snapshots, err := snapshot.ListSnapshots(ctx, recv.repository, source)
 	if err != nil {
-		return nil, errors.WithMessage(err, "Cannot list PEs in repo")
+		return nil, errors.WithMessage(err, "Cannot list snapshots")
 	}
+	for _, snapshot := range snapshots {
 
-	for _, source := range sources {
-		checkPEID, err := astrolabe.NewProtectedEntityIDFromString(source.Path)
-		if err == nil && checkPEID == id {
-			snapshots, err := snapshot.ListSnapshots(ctx, recv.repository, source)
+		if id.String() == snapshot.Description {
+			root, err := snapshotfs.SnapshotRoot(recv.repository, snapshot)
 			if err != nil {
-				return nil, errors.WithMessage(err, "Cannot list snapshots")
+				return nil, errors.WithMessage(err, "Cannot get root")
 			}
-			for _, snapshot := range snapshots {
 
-				if id.GetSnapshotID().String() == snapshot.Description {
-					root, err := snapshotfs.SnapshotRoot(recv.repository, snapshot)
-					if err != nil {
-						return nil, errors.WithMessage(err, "Cannot get root")
-					}
-
-					rootDir, ok := root.(fs.Directory)
-					if !ok {
-						return nil, errors.WithMessagef(err, "Cannot get rootdir for snapshot %s", id.GetSnapshotID().String())
-					}
-					peInfoEntry, err := rootDir.Child(ctx, recv.peinfoName(id))
-					if err != nil {
-						return nil, errors.WithMessagef(err, "Cannot get peinfo %s", recv.peinfoName(id))
-					}
-					peInfoFile, ok := peInfoEntry.(fs.File)
-					if !ok {
-						return nil, errors.WithMessagef(err, "peinfo %s is not a file", recv.peinfoName(id))
-					}
-					peInfoReader, err := peInfoFile.Open(ctx)
-					if err != nil {
-						return nil, errors.WithMessagef(err, "Cannot open peinfo %s", recv.peinfoName(id))
-					}
-					returnPE, err := NewProtectedEntityFromJSONReader(&recv, recv.repository, source, peInfoReader)
-					if err != nil {
-						return nil, errors.Wrapf(err, "NewProtectedEntityFromJSONReader failed for %s", id.String())
-					}
-					return returnPE, nil
-				}
+			rootDir, ok := root.(fs.Directory)
+			if !ok {
+				return nil, errors.WithMessagef(err, "Cannot get rootdir for snapshot %s", id.GetSnapshotID().String())
 			}
+			peInfoEntry, err := rootDir.Child(ctx, recv.peinfoName(id))
+			if err != nil {
+				return nil, errors.WithMessagef(err, "Cannot get peinfo %s", recv.peinfoName(id))
+			}
+			peInfoFile, ok := peInfoEntry.(fs.File)
+			if !ok {
+				return nil, errors.WithMessagef(err, "peinfo %s is not a file", recv.peinfoName(id))
+			}
+			peInfoReader, err := peInfoFile.Open(ctx)
+			if err != nil {
+				return nil, errors.WithMessagef(err, "Cannot open peinfo %s", recv.peinfoName(id))
+			}
+			returnPE, err := NewProtectedEntityFromJSONReader(&recv, recv.repository, source, peInfoReader)
+			if err != nil {
+				return nil, errors.Wrapf(err, "NewProtectedEntityFromJSONReader failed for %s", id.String())
+			}
+			return returnPE, nil
 		}
 	}
+
 	return nil, errors.Errorf("Could not find PE %s", id.String())
 }
 
@@ -199,7 +192,9 @@ func (this ProtectedEntityTypeManager) copyInt(ctx context.Context, sourcePEInfo
 	_, err = rpe.DeleteSnapshot(ctx, id.GetSnapshotID(), make(map[string]map[string]interface{}))
 
 	err = rpe.copy(ctx, dataReader, metadataReader)
-
+	if err != nil {
+		return nil, err
+	}
 	return rpe, nil
 }
 

@@ -19,11 +19,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/kopia/kopia/fs"
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/snapshot"
 	"github.com/kopia/kopia/snapshot/policy"
 	"github.com/kopia/kopia/snapshot/snapshotfs"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/vmware-tanzu/astrolabe/pkg/astrolabe"
 	"io"
 	"sync"
@@ -36,6 +38,8 @@ type ProtectedEntity struct{
 	repository repo.Repository
 	source snapshot.SourceInfo
 	rpetm *ProtectedEntityTypeManager
+	logger   logrus.FieldLogger
+
 }
 
 func NewProtectedEntityFromJSONBuf(rpetm *ProtectedEntityTypeManager, respository repo.Repository,
@@ -49,6 +53,7 @@ func NewProtectedEntityFromJSONBuf(rpetm *ProtectedEntityTypeManager, respositor
 	pe.rpetm = rpetm
 	pe.repository = respository
 	pe.source = source
+	pe.logger = rpetm.logger
 	return
 }
 
@@ -62,6 +67,7 @@ func NewProtectedEntityFromJSONReader(rpetm *ProtectedEntityTypeManager, resposi
 		pe.rpetm = rpetm
 		pe.repository = respository
 		pe.source = source
+		pe.logger = rpetm.logger
 	}
 	return
 }
@@ -79,7 +85,27 @@ func (recv ProtectedEntity) Snapshot(ctx context.Context, params map[string]map[
 }
 
 func (recv ProtectedEntity) ListSnapshots(ctx context.Context) ([]astrolabe.ProtectedEntitySnapshotID, error) {
-	panic("implement me")
+	sourceInfo := getSourceInfo(recv.GetID())
+	snapshotManifests, err := snapshot.ListSnapshots(ctx, recv.repository, sourceInfo)
+	if err != nil {
+		return nil, errors.WithMessagef(err, "error listing kopia snapshots for %s", sourceInfo.Path)
+	}
+	var snapshotIDs []astrolabe.ProtectedEntitySnapshotID
+	for _, snapshotManifest := range snapshotManifests {
+		curID, err := astrolabe.NewProtectedEntityIDFromString(snapshotManifest.Description)
+		if err != nil {
+			recv.logger.Errorf("Could not parse description '%s' from snapshot id %s as Protected Entity ID", snapshotManifest.Description,
+				snapshotManifest.ID)
+		} else {
+			if curID.HasSnapshot() {
+				snapshotIDs = append(snapshotIDs, curID.GetSnapshotID())
+			} else {
+				recv.logger.Errorf("Protected Entity ID '%s' from snapshot id %s doest not have a snapshot ID", curID.String(),
+					snapshotManifest.ID)
+			}
+		}
+	}
+	return snapshotIDs, nil
 }
 
 func (recv ProtectedEntity) DeleteSnapshot(ctx context.Context, snapshotToDelete astrolabe.ProtectedEntitySnapshotID, params map[string]map[string]interface{}) (bool, error) {
@@ -99,7 +125,29 @@ func (recv ProtectedEntity) GetID() astrolabe.ProtectedEntityID {
 }
 
 func (recv ProtectedEntity) GetDataReader(ctx context.Context) (io.ReadCloser, error) {
-	panic("implement me")
+	id := recv.GetID()
+	if ! id.HasSnapshot() {
+		return nil, errors.New("Must be a snapshot")
+	}
+	snapshotID := id.GetSnapshotID()
+	manifest, err := recv.getManifestForSnapshot(ctx, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	root, err := snapshotfs.EntryFromDirEntry(recv.repository, manifest.RootEntry)
+	dataEntry, err := root.(fs.Directory).Child(ctx, recv.rpetm.dataName(recv.GetID()))
+	if err != nil {
+		return nil, errors.WithMessage(err,"Error retrieveing data entry")
+	}
+	dataFile, ok := dataEntry.(fs.File)
+	if !ok {
+		return nil, errors.Errorf("Entry %s is not a file", dataEntry.Name())
+	}
+	dataReader, err := dataFile.Open(ctx)
+	if err != nil {
+		return nil, errors.WithMessagef(err, "Could not get data reader")
+	}
+	return dataReader, nil
 }
 
 func (recv ProtectedEntity) GetMetadataReader(ctx context.Context) (io.ReadCloser, error) {
@@ -112,18 +160,46 @@ func (recv ProtectedEntity) Overwrite(ctx context.Context, sourcePE astrolabe.Pr
 
 const maxPEInfoSize int = 16 * 1024
 
+func getSourceInfo(id astrolabe.ProtectedEntityID) snapshot.SourceInfo {
+	return snapshot.SourceInfo{
+		Host:     "localhost",	// TODO - put something reasonable in here
+		UserName: "astrolabe",
+		Path:     id.GetID(),
+	}
+}
+func (recv ProtectedEntity) getManifestForSnapshot(ctx context.Context, snapshotID astrolabe.ProtectedEntitySnapshotID) (*snapshot.Manifest, error) {
+	sourceInfo := getSourceInfo(recv.GetID())
+	snapshotManifests, err := snapshot.ListSnapshots(ctx, recv.repository, sourceInfo)
+	if err != nil {
+		return nil, errors.WithMessagef(err, "error listing kopia snapshots for %s", sourceInfo.Path)
+	}
+	for _, snapshotManifest := range snapshotManifests {
+		curID, err := astrolabe.NewProtectedEntityIDFromString(snapshotManifest.Description)
+		if err != nil {
+			recv.logger.Errorf("Could not parse description '%s' from snapshot id %s as Protected Entity ID", snapshotManifest.Description,
+				snapshotManifest.ID)
+		} else {
+			if curID.HasSnapshot() {
+				if curID == recv.GetID().IDWithSnapshot(snapshotID) {
+					return snapshotManifest, nil
+				}
+			} else {
+				recv.logger.Errorf("Protected Entity ID '%s' from snapshot id %s doest not have a snapshot ID", curID.String(),
+					snapshotManifest.ID)
+			}
+		}
+	}
+	return nil, errors.Errorf("Snapshot ID %s not found", snapshotID.String())
+}
 func (recv *ProtectedEntity) copy(ctx context.Context,dataReader io.ReadCloser,
 	metadataReader io.ReadCloser) error {
-	snapshotCreateDescription := recv.GetID().String() + " upload"
+	snapshotCreateDescription := recv.GetID().String()
+
 	peEntry, err := NewProtectedEntityKopiaFileWithReaders(ctx, recv, dataReader, metadataReader)
 	repoWriter, err := recv.rpetm.repository.NewWriter(ctx, snapshotCreateDescription)
 	uploader := setupUploader(repoWriter)
 
-	sourceInfo := snapshot.SourceInfo{
-		Host:     "localhost",	// TODO - put something reasonable in here
-		UserName: "astrolabe",
-		Path:     recv.GetID().GetID(),
-	}
+	sourceInfo := getSourceInfo(recv.GetID())
 
 	previous, err := findPreviousSnapshotManifest(ctx, repoWriter, sourceInfo, nil)
 
@@ -153,53 +229,9 @@ func (recv *ProtectedEntity) copy(ctx context.Context,dataReader io.ReadCloser,
 		return errors.Wrap(err, "flush error")
 	}
 
-	//defer recv.cleanupOnAbortedUpload(&ctx)
-	//peInfo := recv.peinfo
-	//peinfoName := recv.rpetm.peinfoName(peInfo.GetID())
-
-
-	/*
-	peInfoBuf, err := json.Marshal(peInfo)
-	if err != nil {
-		return err
+	if err = repoWriter.Close(ctx); err != nil {
+		return errors.Wrap(err, "flush error")
 	}
-	if len(peInfoBuf) > maxPEInfoSize {
-		return errors.New("JSON for pe info > 16K")
-	}
-
-	// TODO: defer the clean up of disk handle of source PE's data reader
-	if dataReader != nil {
-		dataName := recv.rpetm.dataName(peInfo.GetID())
-		snapshot.
-		err = recv.uploadStream(ctx, dataName, maxSegmentSize, dataReader)
-		if err != nil {
-			return err
-		}
-	}
-
-	if metadataReader != nil {
-		mdName := recv.rpetm.metadataName(peInfo.GetID())
-		err = recv.uploadStream(ctx, mdName, maxSegmentSize, metadataReader)
-		if err != nil {
-			return err
-		}
-	}
-	jsonBytes := bytes.NewReader(peInfoBuf)
-
-	jsonParams := &s3.PutObjectInput{
-		Bucket:        aws.String(recv.rpetm.bucket),
-		Key:           aws.String(peinfoName),
-		Body:          jsonBytes,
-		ContentLength: aws.Int64(int64(len(peInfoBuf))),
-		ContentType:   aws.String(peInfoFileType),
-	}
-	_, err = recv.rpetm.s3.PutObjectWithContext(ctx, jsonParams)
-	if err != nil {
-		return errors.Wrapf(err, "copy S3 PutObject for PE info failed for PE %s bucket %s key %s",
-			peInfo.GetID(), recv.rpetm.bucket, peinfoName)
-	}
-
-	 */
 	return err
 }
 
@@ -278,7 +310,7 @@ func (recv *peProgress) CachedFile(fname string, numBytes int64) {
 // findPreviousSnapshotManifest returns the list of previous snapshots for a given source, including
 // last complete snapshot and possibly some number of incomplete snapshots following it.
 func findPreviousSnapshotManifest(ctx context.Context, rep repo.Repository, sourceInfo snapshot.SourceInfo, noLaterThan *time.Time) ([]*snapshot.Manifest, error) {
-	man, err := snapshot.ListSnapshots(ctx, rep, sourceInfo)
+	snapshotManifests, err := snapshot.ListSnapshots(ctx, rep, sourceInfo)
 	if err != nil {
 		return nil, errors.Wrap(err, "error listing previous snapshots")
 	}
@@ -290,14 +322,14 @@ func findPreviousSnapshotManifest(ctx context.Context, rep repo.Repository, sour
 
 	var result []*snapshot.Manifest
 
-	for _, p := range man {
-		if noLaterThan != nil && p.StartTime.After(*noLaterThan) {
+	for _, snapshotManifest := range snapshotManifests {
+		if noLaterThan != nil && snapshotManifest.StartTime.After(*noLaterThan) {
 			continue
 		}
 
-		if p.IncompleteReason == "" && (previousComplete == nil || p.StartTime.After(previousComplete.StartTime)) {
-			previousComplete = p
-			previousCompleteStartTime = p.StartTime
+		if snapshotManifest.IncompleteReason == "" && (previousComplete == nil || snapshotManifest.StartTime.After(previousComplete.StartTime)) {
+			previousComplete = snapshotManifest
+			previousCompleteStartTime = snapshotManifest.StartTime
 		}
 	}
 
@@ -306,7 +338,7 @@ func findPreviousSnapshotManifest(ctx context.Context, rep repo.Repository, sour
 	}
 
 	// add all incomplete snapshots after that
-	for _, p := range man {
+	for _, p := range snapshotManifests {
 		if noLaterThan != nil && p.StartTime.After(*noLaterThan) {
 			continue
 		}
