@@ -117,7 +117,14 @@ func (recv ProtectedEntity) GetInfoForSnapshot(ctx context.Context, snapshotID a
 }
 
 func (recv ProtectedEntity) GetComponents(ctx context.Context) ([]astrolabe.ProtectedEntity, error) {
-	panic("implement me")
+	componentIDs := recv.peinfo.GetComponentIDs()
+	components := make([]astrolabe.ProtectedEntity, len(componentIDs))
+	/*
+		for curComponentIDNum, curComponentID := range componentIDs {
+			components[curComponentID] = recv.rpetm.
+		}
+	*/
+	return components, nil
 }
 
 func (recv ProtectedEntity) GetID() astrolabe.ProtectedEntityID {
@@ -151,8 +158,29 @@ func (recv ProtectedEntity) GetDataReader(ctx context.Context) (io.ReadCloser, e
 }
 
 func (recv ProtectedEntity) GetMetadataReader(ctx context.Context) (io.ReadCloser, error) {
-	panic("implement me")
-}
+	id := recv.GetID()
+	if ! id.HasSnapshot() {
+		return nil, errors.New("Must be a snapshot")
+	}
+	snapshotID := id.GetSnapshotID()
+	manifest, err := recv.getManifestForSnapshot(ctx, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	root, err := snapshotfs.EntryFromDirEntry(recv.repository, manifest.RootEntry)
+	metadataEntry, err := root.(fs.Directory).Child(ctx, recv.rpetm.metadataName(recv.GetID()))
+	if err != nil {
+		return nil, errors.WithMessage(err,"Error retrieveing data entry")
+	}
+	metadataFile, ok := metadataEntry.(fs.File)
+	if !ok {
+		return nil, errors.Errorf("Entry %s is not a file", metadataEntry.Name())
+	}
+	metadataReader, err := metadataFile.Open(ctx)
+	if err != nil {
+		return nil, errors.WithMessagef(err, "Could not get metadata reader")
+	}
+	return metadataReader, nil}
 
 func (recv ProtectedEntity) Overwrite(ctx context.Context, sourcePE astrolabe.ProtectedEntity, params map[string]map[string]interface{}, overwriteComponents bool) error {
 	panic("implement me")
@@ -164,7 +192,7 @@ func getSourceInfo(id astrolabe.ProtectedEntityID) snapshot.SourceInfo {
 	return snapshot.SourceInfo{
 		Host:     "localhost",	// TODO - put something reasonable in here
 		UserName: "astrolabe",
-		Path:     id.GetID(),
+		Path:     id.GetBaseID().String(),
 	}
 }
 func (recv ProtectedEntity) getManifestForSnapshot(ctx context.Context, snapshotID astrolabe.ProtectedEntitySnapshotID) (*snapshot.Manifest, error) {

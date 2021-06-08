@@ -58,8 +58,19 @@ func (recv ProtectedEntityTypeManager) GetProtectedEntity(ctx context.Context, i
 		return nil, errors.WithMessage(err, "Cannot list snapshots")
 	}
 	for _, snapshot := range snapshots {
-
-		if id.String() == snapshot.Description {
+		descriptionID, err := astrolabe.NewProtectedEntityIDFromString(snapshot.Description)
+		if err != nil {
+			continue;	// Malformed description
+		}
+		var checkPEID astrolabe.ProtectedEntityID
+		// In the Kopia repo, every entry has a snapshot.  If there is no snapshot, we'll just take the first PEInfo we
+		// find with the same base ID
+		if id.HasSnapshot() {
+			checkPEID = descriptionID
+		} else {
+			checkPEID = descriptionID.GetBaseID()
+		}
+		if id == checkPEID {
 			root, err := snapshotfs.SnapshotRoot(recv.repository, snapshot)
 			if err != nil {
 				return nil, errors.WithMessage(err, "Cannot get root")
@@ -69,22 +80,24 @@ func (recv ProtectedEntityTypeManager) GetProtectedEntity(ctx context.Context, i
 			if !ok {
 				return nil, errors.WithMessagef(err, "Cannot get rootdir for snapshot %s", id.GetSnapshotID().String())
 			}
-			peInfoEntry, err := rootDir.Child(ctx, recv.peinfoName(id))
+			peinfoName := recv.peinfoName(descriptionID)
+			peInfoEntry, err := rootDir.Child(ctx, peinfoName)
 			if err != nil {
-				return nil, errors.WithMessagef(err, "Cannot get peinfo %s", recv.peinfoName(id))
+				return nil, errors.WithMessagef(err, "Cannot get peinfo %s", peinfoName)
 			}
 			peInfoFile, ok := peInfoEntry.(fs.File)
 			if !ok {
-				return nil, errors.WithMessagef(err, "peinfo %s is not a file", recv.peinfoName(id))
+				return nil, errors.WithMessagef(err, "peinfo %s is not a file", peinfoName)
 			}
 			peInfoReader, err := peInfoFile.Open(ctx)
 			if err != nil {
-				return nil, errors.WithMessagef(err, "Cannot open peinfo %s", recv.peinfoName(id))
+				return nil, errors.WithMessagef(err, "Cannot open peinfo %s", peinfoName)
 			}
 			returnPE, err := NewProtectedEntityFromJSONReader(&recv, recv.repository, source, peInfoReader)
 			if err != nil {
 				return nil, errors.Wrapf(err, "NewProtectedEntityFromJSONReader failed for %s", id.String())
 			}
+			// TODO - if there's no snapshot specified we should clear the snapshot ID from the returned PE
 			return returnPE, nil
 		}
 	}
