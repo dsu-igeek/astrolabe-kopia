@@ -17,12 +17,15 @@ package kopiarepo
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/blob/filesystem"
+	"github.com/kopia/kopia/repo/blob/s3"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/vmware-tanzu/astrolabe/pkg/astrolabe"
+	"io/ioutil"
 	"os"
 	"strings"
 	"sync"
@@ -51,6 +54,18 @@ func (recv fsStorageFactory) getStorage(peTypeName string, create bool) (fsStora
 	return
 }
 
+
+type s3StorageFactory struct {
+	s3.Options
+}
+
+func (recv s3StorageFactory) getStorage(peTypeName string, create bool) (s3Storage blob.Storage, err error) {
+	peOptions := recv.Options
+	peOptions.Prefix = peOptions.Prefix + "/" + peTypeName + "/"
+	return s3.New(context.Background(), &peOptions)
+}
+
+
 type storageFactory interface {
 	getStorage(peTypeName string, create bool) (storage blob.Storage, err error)
 }
@@ -67,6 +82,7 @@ type RepositoryProtectedEntityManager struct {
 const CONFIG_FILE_EXT = ".kopia"
 const PE_FS_STORAGE_DIR = "pes"
 const CONFIG_DIR = "configs"
+const PE_S3CONFIG_FILE = "s3_config.json"
 
 func NewKopiaRepositoryProtectedEntityManager(repoDir string, logger logrus.FieldLogger) (astrolabe.ProtectedEntityManager, error) {
 	repoDirInfo, err := os.Stat(repoDir)
@@ -77,24 +93,52 @@ func NewKopiaRepositoryProtectedEntityManager(repoDir string, logger logrus.Fiel
 		return nil, errors.Errorf("repoDir %s is not a directory", repoDir)
 	}
 
-	pesDir := repoDir + string(os.PathSeparator) + PE_FS_STORAGE_DIR
-	pesDirInfo, err := os.Stat(pesDir)
+	s3ConfigFile := repoDir + string(os.PathSeparator) + PE_S3CONFIG_FILE
+	s3ConfigFileInfo, err := os.Stat(s3ConfigFile)
 
-	if err != nil {
-		if os.IsNotExist(err) {
-			err = os.Mkdir(pesDir, 0755)
-			if err != nil {
-				return nil, err
-			}
+	var repoStorageFactory storageFactory
+	if err == nil {
+		if s3ConfigFileInfo.IsDir() {
+			return nil, errors.Errorf("%s is a directory", s3ConfigFile)
+		}
+		s3ConfigFile, err := os.Open(s3ConfigFile)
+		if err != nil {
+			return nil, err
+		}
+		defer s3ConfigFile.Close()
+		jsonBytes, err := ioutil.ReadAll(s3ConfigFile)
+		if err != nil {
+			return nil, err
+		}
+		s3Options := s3.Options{}
+		err = json.Unmarshal(jsonBytes, &s3Options)
+		if err != nil {
+			return nil, err
+		}
+		repoStorageFactory = s3StorageFactory{
+			Options: s3Options,
 		}
 	} else {
-		if !pesDirInfo.IsDir() {
-			return nil, errors.Errorf("pesDir %s is not a directory", pesDir)
+		pesDir := repoDir + string(os.PathSeparator) + PE_FS_STORAGE_DIR
+		pesDirInfo, err := os.Stat(pesDir)
+
+		if err != nil {
+			if os.IsNotExist(err) {
+				err = os.Mkdir(pesDir, 0755)
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			if !pesDirInfo.IsDir() {
+				return nil, errors.Errorf("pesDir %s is not a directory", pesDir)
+			}
 		}
-	}
-	// TODO - initialize storage info
-	repoStorageFactory := fsStorageFactory {
-		pesDir: pesDir,
+
+		// TODO - initialize storage info
+		repoStorageFactory = fsStorageFactory{
+			pesDir: pesDir,
+		}
 	}
 	configFilesDir := repoDir + string(os.PathSeparator) + CONFIG_DIR
 	configFilesDirInfo, err := os.Stat(configFilesDir)

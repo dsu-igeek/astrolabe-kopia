@@ -18,17 +18,132 @@ package kopiarepo
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"github.com/google/uuid"
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/blob/filesystem"
+	"github.com/kopia/kopia/repo/blob/s3"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/vmware-tanzu/astrolabe/pkg/astrolabe"
 	astrolabefs "github.com/vmware-tanzu/astrolabe/pkg/fs"
 	"io"
+	"net"
+	"os"
 	"testing"
 )
 
+func TestS3(t *testing.T) {
+	ctx := context.Background()
+
+	repoDir, err := os.MkdirTemp("", "kopia-test-s3-repo")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	options := s3.Options{
+		BucketName:                     "dsu-kopia",
+		Prefix:                         "test",
+		AccessKeyID:                    "",
+		SecretAccessKey:                "",
+		Region:                         "us-east-1",
+		Endpoint:                       "s3.us-east-1.amazonaws.com",
+	}
+	repoConfFilePath := repoDir + string(os.PathSeparator) + PE_S3CONFIG_FILE
+
+	repoConfFile, err := os.Create(repoConfFilePath)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	optionsBytes, err := json.Marshal(options)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	bytesWritten, err := repoConfFile.Write(optionsBytes)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if bytesWritten != len(optionsBytes) {
+		t.Fatalf("OptionsBytes len = %d, wrote %d", len(optionsBytes), bytesWritten)
+	}
+	repoConfFile.Close()
+	rpem, err := NewKopiaRepositoryProtectedEntityManager(repoDir, logrus.StandardLogger())
+	logger := logrus.StandardLogger()
+	rpetm := rpem.GetProtectedEntityTypeManager("fs")
+
+	fsParams := make(map[string]interface{})
+	fsParams["root"] = "/home/dsmithuchida/astrolabe_fs_root"
+
+	fsPETM, err := astrolabefs.NewFSProtectedEntityTypeManagerFromConfig(fsParams, astrolabe.S3Config{
+		Port:      9000,
+		Host:      net.IPv4(127,0,0,1),
+		AccessKey: "accessKey",
+		Secret:    "secret",
+		Prefix:    "",
+		URLBase:   "",
+		Region:    "local",
+		UseHttp:   false,
+	}, logrus.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fsPEs, err := fsPETM.GetProtectedEntities(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fsPEID := range fsPEs {
+		// FS doesn't have snapshots, but repository likes them, so fake one
+		snapID, err := uuid.NewRandom()
+
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapPEID := astrolabe.NewProtectedEntityIDWithSnapshotID(fsPEID.GetPeType(), fsPEID.GetID(),
+			astrolabe.NewProtectedEntitySnapshotID(snapID.String()))
+		fsPE, err := fsPETM.GetProtectedEntity(ctx, snapPEID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3PE, err := rpetm.Copy(ctx, fsPE, make(map[string]map[string]interface{}), astrolabe.AllocateNewObject)
+		if err != nil {
+			t.Fatal(err)
+		}
+		logger.Printf("Created new kopia PE %s\n", s3PE.GetID().String())
+/*
+		rep.Close(ctx)
+
+		newRep, err := repo.Open(ctx, configFile, masterPassword, openOpt)
+		if err != nil {
+			t.Fatalf("can't open: %v", err)
+		}
+		rpetm, err := NewProtectedEntityTypeManager(context.TODO(), "fs", newRep, logger)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		checkPE, err := rpetm.GetProtectedEntity(ctx, fsPE.GetID())
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		fsDataReader, err := fsPE.GetDataReader(ctx)
+		checkDataReader, err := checkPE.GetDataReader(ctx)
+		err = compareStreams(fsDataReader, checkDataReader)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+ */
+		/*
+			newFSPE, err := fsPETM.Copy(ctx, s3PE, make(map[string]map[string]interface{}), astrolabe.AllocateNewObject)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger.Printf("Restored new FSPE %s\n", newFSPE.GetID().String())
+		*/
+	}
+}
 func Test(t *testing.T) {
 	ctx := context.Background()
 	st, err := filesystem.New(ctx, &filesystem.Options{
@@ -47,6 +162,7 @@ func Test(t *testing.T) {
 	openOpt := &repo.Options{}
 
 	rep, err := repo.Open(ctx, configFile, masterPassword, openOpt)
+	defer rep.Close(ctx)
 	if err != nil {
 		t.Fatalf("can't open: %v", err)
 	}
@@ -132,7 +248,6 @@ func Test(t *testing.T) {
 		logger.Printf("Restored new FSPE %s\n", newFSPE.GetID().String())
 		 */
 	}
-	rep.Close(ctx)
 }
 
 func compareStreams(stream1, stream2 io.ReadCloser) error {
