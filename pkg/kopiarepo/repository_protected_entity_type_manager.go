@@ -246,3 +246,7 @@ func (this *ProtectedEntityTypeManager) dataTransportsForID(id astrolabe.Protect
 func (this *ProtectedEntityTypeManager) metadataTransportsForID(id astrolabe.ProtectedEntityID) ([]astrolabe.DataTransport, error) {
 	return []astrolabe.DataTransport{}, nil
 }
+
+func (this ProtectedEntityTypeManager) GetCapabilities() map[string]string {
+	return map[string]string{}	// We don't have any capabilities for the Kopia repos
+}
